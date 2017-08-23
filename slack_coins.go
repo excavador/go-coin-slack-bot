@@ -30,86 +30,29 @@ import (
 	"log"
 	"os"
 	"strings"
-	"io/ioutil"
-	"encoding/json"
-	"net/http"
 	"sort"
 	"strconv"
 	"time"
-	"math"
+	"context"
+	"os/signal"
+	"syscall"
+	"sync"
 )
 
-type TickersPipeline interface {
-	FetchCoins(symbol string) (*[]TickerData, error)
-}
-
-type coinMarket struct{}
-
-func makeCoinMarket() TickersPipeline {
+func NewCoinMarker() TickersPipeline {
 	return &coinMarket{}
 }
 
 var mkt TickersPipeline
 
-type Watch struct {
-	channel   string
-	name      string
-	lastPrice float64
-	threshold int
-}
-
-type WatchList map[string]*Watch
-
-var watchList WatchList
-
 func init() {
-	mkt = makeCoinMarket()
-	watchList = make(WatchList)
-}
-
-type TickerData struct {
-	Id               string  `json:"id"`
-	Name             string  `json:"name"`
-	Symbol           string  `json:"symbol"`
-	Rank             int16    `json:"rank,string"`
-	PriceUSD         float64 `json:"price_usd,string"`
-	PriceBTC         float64 `json:"price_btc,string"`
-	Volume24H        float64 `json:"24h_volume_usd,string"`
-	MarketCapUSD     float64 `json:"market_cap_usd,string"`
-	AvailableSupply  float64 `json:"available_supply,string"`
-	TotalSupply      float64 `json:"total_supply,string"`
-	PercentChange1H  float32 `json:"percent_change_1h,string"`
-	PercentChange24H float32 `json:"percent_change_24h,string"`
-	PercentChange7D  float32 `json:"percent_change_7d,string"`
-	LastUpdated      int32   `json:"last_updated,string"`
+	mkt = NewCoinMarker()
 }
 
 func LogError(err error) {
 	fmt.Println(err)
 }
 
-func (mkt *coinMarket) FetchCoins(coinCode string) (result []TickerData, err error) {
-	url := "https://api.coinmarketcap.com/v1/ticker"
-	if coinCode != "" {
-		url = fmt.Sprintf("%s/%s", url, coinCode)
-	}
-	var resp *http.Response
-	if resp, err = http.Get(url); err != nil {
-		LogError(err)
-		return
-	}
-	defer resp.Body.Close()
-	var body []byte
-	if body, err = ioutil.ReadAll(resp.Body); err != nil {
-		LogError(err)
-		return
-	}
-	if err = json.Unmarshal(body, &result); err != nil {
-		LogError(err)
-		return
-	}
-	return
-}
 
 func main() {
 	if len(os.Args) != 2 {
@@ -117,7 +60,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	// start a websocket-based Real Time API session
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+
+	var wait sync.WaitGroup
+
+	signalChannel := make(chan os.Signal, 1)
+	signal.Notify(signalChannel, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM)
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		<-signalChannel
+		cancel()
+	}()
+
+		// start a websocket-based Real Time API session
 	ws, id := slackConnect(os.Args[1])
 	fmt.Println("My ID: ", id)
 	fmt.Println("mybot ready, ^C exits")
@@ -131,6 +88,9 @@ func main() {
 			"*watchlist* - list current watched coins"
 		postMessage(ws, m)
 	}
+
+	wl := NewWatchList(ctx)
+
 
 	msgF := func(m Message) {
 		recv := func() {
@@ -146,25 +106,20 @@ func main() {
 			case "watch":
 				if len(parts) != 4 {
 					helpF(m)
-				} else if r, err := strconv.Atoi(parts[3]); err == nil && r > 0 {
-					parts[2] = strings.ToLower(parts[2])
-					if v, err := mkt.FetchCoins(""); err == nil {
-						var coin *TickerData
-						for _, c := range *v {
-							if strings.ToLower(c.Symbol) == parts[2] {
-								coin = &c
+				} else if threshold, err := strconv.Atoi(parts[3]); err == nil && threshold > 0 {
+					symbol := strings.ToLower(parts[2])
+					if tdl, err := mkt.FetchCoins(ctx, ""); err == nil {
+						var td *TickerData
+						for _, current := range tdl {
+							if strings.ToLower(string(td.Symbol)) == symbol {
+								td = &current
 								break
 							}
 						}
-						if coin != nil {
-							watchList[parts[2]] = &Watch{
-								channel:   m.Channel,
-								name:      coin.Name,
-								lastPrice: coin.PriceUSD,
-								threshold: r,
-							}
+						if td != nil {
+							wl.Watch(ctx, m.Channel, threshold, td)
 						} else {
-							m.Text = "Coin '" + parts[2] + "' does not exist"
+							m.Text = "Coin '" + symbol + "' does not exist"
 							postMessage(ws, m)
 						}
 					} else {
@@ -176,19 +131,19 @@ func main() {
 					postMessage(ws, m)
 				}
 			case "unwatch":
-				delete(watchList, parts[2])
+				wl.UnWatch(ctx, parts[2])
 			case "watchlist":
-				msg := "Tickers: ["
-				for k := range watchList {
-					msg = msg + " " + k + " "
-				}
-				m.Text = msg + "]"
+				var sl []string
+				wl.Foreach(ctx, func(symbol string, watch Watch) {
+					sl = append(sl, string(symbol))
+				})
+				m.Text = fmt.Sprintf("Tickers: [%s]", strings.Join(sl, " "))
 				postMessage(ws, m)
 			case "coin":
 				// looks good, get the quote and reply with the result
 				go func(m Message) {
 					defer recv()
-					m.Text = getQuote(parts[2:])
+					m.Text = getQuote(ctx, parts[2:])
 					postMessage(ws, m)
 				}(m)
 			case "rank":
@@ -197,7 +152,7 @@ func main() {
 					r = 10
 				}
 				go func(m Message) {
-					m.Text = rankCoins(r)
+					m.Text = rankCoins(ctx, r)
 					postMessage(ws, m)
 				}(m)
 			default:
@@ -207,65 +162,79 @@ func main() {
 		}
 	}
 
-	loop := func() {
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				log.Fatal(r)
 			}
 		}()
-		m, err := getMessage(ws)
-		if err != nil {
-			log.Fatal(err)
-		}
-		msgF(m)
-	}
-
-	ticker := time.NewTicker(30 * time.Second)
-
-	go func() {
-		for range ticker.C {
-			for key, sym := range watchList {
-				fmt.Printf("Check %1s : %2s\n", key, sym.name)
-				v, err := mkt.FetchCoins(sym.name)
-				if err != nil {
-					fmt.Printf("Skipping %1s\n", key)
-					continue
-				}
-				if v != nil && sym.lastPrice > 0 {
-					delta := (*v)[0].PriceUSD - sym.lastPrice
-					fmt.Printf("Delta %1s - %2.2f, threshold %3d\n", key, delta, sym.threshold)
-					if math.Abs(delta) > float64(sym.threshold) {
-						postMessage(ws, Message{
-							Channel: sym.channel,
-							Type:    "message",
-							Text:    fmt.Sprintf("[ %1s ] $%+2.2f to $%3.2f", (*v)[0].Symbol, delta, (*v)[0].PriceUSD),
-						})
-					}
-				}
-				sym.lastPrice = (*v)[0].PriceUSD
+		for {
+			if m, err := getMessage(ws); err != nil {
+				LogError(err)
+				cancel()
+			} else {
+				msgF(m)
 			}
 		}
 	}()
 
-	for {
-		loop()
-	}
+	ticker := time.NewTicker(30 * time.Second)
+
+	wait.Add(1)
+	go func () {
+		defer wait.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Fatal(r)
+			}
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sl := make(map[string]Watch)
+				wl.Foreach(ctx, func(symbol string, watch Watch) {
+					sl[symbol] = watch
+				})
+				for symbol, watch := range sl {
+					fmt.Printf("Check %1s : %2s\n", symbol, watch.Name)
+					var td []TickerData
+					var err error
+					if td, err = mkt.FetchCoins(ctx, symbol); err != nil {
+						fmt.Printf("Skipping %1s\n", symbol)
+						return
+					}
+					if len(td) == 0 {
+						continue
+					}
+					if message := wl.Update(ctx, &td[0]); message != nil {
+						postMessage(ws, *message)
+					}
+				}
+			}
+
+		}
+	}()
+	<-ctx.Done()
 }
 
 // Get the quote via Yahoo. You should replace this method to something
 // relevant to your team!
-func getQuote(sym []string) string {
+func getQuote(ctx context.Context, sym []string) string {
 
 	set := make(map[string]bool)
 	for _, v := range sym {
 		set[strings.ToLower(v)] = true
 	}
 
-	coins, err := mkt.FetchCoins("")
-	if err == nil && coins != nil && len(*coins) > 0 {
+	coins, err := mkt.FetchCoins(ctx, "")
+	if err == nil && coins != nil && len(coins) > 0 {
 		var resp string
 		found := false
-		for _, coin := range *coins {
+		for _, coin := range coins {
 			if _, ok := set[strings.ToLower(coin.Symbol)]; ok {
 				found = true
 				resp = resp + fmt.Sprintf("%1s $%2.2f, update 1H: %3.2f%%, update 24H: %4.2f%%\n",
@@ -283,7 +252,7 @@ func getQuote(sym []string) string {
 
 }
 
-func rankCoins(limit int) string {
+func rankCoins(ctx context.Context, limit int) string {
 	min := func(l, r int) int {
 		if l < r {
 			return l
@@ -292,11 +261,11 @@ func rankCoins(limit int) string {
 		}
 	}
 
-	coins, err := mkt.FetchCoins("")
-	if err == nil && coins != nil && len(*coins) > 0 {
+	coins, err := mkt.FetchCoins(ctx,"")
+	if err == nil && coins != nil && len(coins) > 0 {
 		var resp string
-		sort.Sort(Sortable(*coins))
-		for _, v := range (*coins)[:min(limit, 30)] {
+		sort.Sort(Sortable(coins))
+		for _, v := range coins[:min(limit, 30)] {
 			resp = resp + fmt.Sprintf("%1s : %2s => price: $%3.2f : market: $%4.2f\n", v.Name, v.Symbol, v.PriceUSD, v.MarketCapUSD)
 		}
 		return resp

@@ -87,13 +87,6 @@ func slackStart(token string) (wsurl, id string, err error) {
 // struct serves as both read and write, we include the "Id" field which is
 // required only for writing.
 
-type Message struct {
-	Id      uint64 `json:"id"`
-	Type    string `json:"type"`
-	Channel string `json:"channel"`
-	Text    string `json:"text"`
-}
-
 func getMessage(ws *websocket.Conn) (m Message, err error) {
 	err = websocket.JSON.Receive(ws, &m)
 	return
